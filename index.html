@@ -1,469 +1,547 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>NYB Solar & CCTV — Instant Quote</title>
-  <style>
-    :root {
-      --brand: #0e7490; /* teal-700 */
-      --brand-2: #155e75; /* teal-800 */
-      --accent: #f59e0b; /* amber-500 */
-      --ink: #0f172a; /* slate-900 */
-      --muted: #475569; /* slate-600 */
-      --bg: #f8fafc; /* slate-50 */
-      --card: #ffffff;
-      --ring: #bae6fd; /* sky-200 */
+import React, { useMemo, useState } from "react";
+
+/**
+ * NYBSOLAR – Interactive Solar System Designer
+ * Location: Sokoto (assume Peak Sun Hours, PSH = 6.0)
+ * Pricing provided by client (all prices in Nigerian Naira, ₦)
+ *
+ * Features
+ * - Load-based sizing: user enters appliances (W, qty, hours) → app sizes inverter, battery, PV, controller.
+ * - Budget-based design: user enters a budget → app suggests best-fit configuration within budget.
+ * - Battery chemistry toggle: Tubular (lead-acid) vs Lithium-ion.
+ * - Panel choice: 550 W or 300 W modules (with unit prices provided).
+ * - Charge controller type: PWM 60 A or MPPT 60 A with auto multiplier.
+ * - Cable sizing helper (suggested cross-sectional area) based on DC currents & typical ampacity.
+ * - Professional landing sections (About, Services, CTA) so this can serve as a real business website starter.
+ *
+ * Assumptions (transparent):
+ * - System voltage auto-select: ≤2 kVA → 24 V, otherwise 48 V (typical in Nigeria).
+ * - Inverter efficiency 90%, PF 0.8; Lithium usable DOD 90%; Tubular (lead-acid) usable DOD 50%.
+ * - PV derating 0.75 (losses); Target volt-drop ≤ 3% on DC cables; Cable table is a practical guide.
+ * - Peak load = sum of appliance watts (assuming simultaneity). You can toggle simultaneity per item.
+ */
+
+// --- Constants ---
+const PSH = 6.0; // Sokoto peak sun hours
+const NAIRA = (v) => `₦${v.toLocaleString()}`;
+
+const PRICES = {
+  inverter: {
+    "1kVA": 130_000,
+    "2kVA": 190_000,
+    "5kVA": 500_000,
+    "10kVA": 1_000_000,
+  },
+  panels: {
+    550: 130_000,
+    300: 75_000,
+  },
+  batteries: {
+    tubular220Ah12V: 275_000, // ~2.64 kWh nameplate, ~1.32 kWh usable @ 50%DOD
+    li10kWh: 1_800_000,
+    li15kWh: 2_000_000,
+  },
+  controllers: {
+    pwm60A: 40_000,
+    mppt60A: 200_000,
+  },
+};
+
+// Cable ampacity (conservative, copper, typical ambient, bundled lightly). Adjust in field as needed.
+// Current (A) → recommended mm².
+const CABLE_TABLE = [
+  { upto: 20, mm2: 2.5 },
+  { upto: 35, mm2: 4 },
+  { upto: 50, mm2: 6 },
+  { upto: 80, mm2: 10 },
+  { upto: 110, mm2: 16 },
+  { upto: 140, mm2: 25 },
+  { upto: 180, mm2: 35 },
+  { upto: 240, mm2: 50 },
+  { upto: 310, mm2: 70 },
+];
+
+function cableSizeForCurrent(I) {
+  for (const row of CABLE_TABLE) {
+    if (I <= row.upto) return row.mm2;
+  }
+  return 95; // very high current fallback
+}
+
+// --- Helpers ---
+function roundUp(n, step = 1) {
+  return Math.ceil(n / step) * step;
+}
+
+function chooseSystemVoltage(kVA) {
+  return kVA <= 2 ? 24 : 48;
+}
+
+function pickInverterByPeakLoad(peakW) {
+  // PF assumed 0.8 → kVA = W / (PF * 1000)
+  const kVAneeded = peakW / (0.8 * 1000);
+  const sizes = [1, 2, 5, 10];
+  const pick = sizes.find((s) => s >= kVAneeded) ?? 10;
+  return { kVA: pick, price: PRICES.inverter[`${pick}kVA`], kW: pick * 0.8 };
+}
+
+function batteryBlocksRequired(dailyWh, daysAutonomy, Vsys, chem) {
+  const inverterEff = 0.9;
+  if (chem === "lithium") {
+    // Lithium blocks: choose from 10 kWh and 15 kWh (90% usable).
+    const usablePer10 = 10_000 * 0.9;
+    const usablePer15 = 15_000 * 0.9;
+    const targetWh = (dailyWh * daysAutonomy) / inverterEff;
+    // Greedy: prefer 15 kWh blocks, then top up with 10 kWh.
+    let n15 = Math.floor(targetWh / usablePer15);
+    let rem = targetWh - n15 * usablePer15;
+    let n10 = Math.ceil(rem / usablePer10);
+    if (n15 === 0 && n10 === 0) n10 = 1;
+    const usableWh = n15 * usablePer15 + n10 * usablePer10;
+    const price = n15 * PRICES.batteries.li15kWh + n10 * PRICES.batteries.li10kWh;
+    return { n10, n15, usableWh, price, label: `${n15}×15kWh, ${n10}×10kWh` };
+  } else {
+    // Tubular 220Ah 12 V batteries (50% usable). Each ~1320 Wh usable.
+    const usablePer = 220 * 12 * 0.5; // 1320 Wh
+    const targetWh = (dailyWh * daysAutonomy) / inverterEff;
+    const n = Math.ceil(targetWh / usablePer);
+    const price = n * PRICES.batteries.tubular220Ah12V;
+    return { n, usableWh: n * usablePer, price, label: `${n}×220Ah/12V (tubular)` };
+  }
+}
+
+function arraySizing(dailyWh, panelW, derate = 0.75) {
+  // PvPowerNeeded = DailyWh / (PSH * derate)
+  const requiredW = dailyWh / (PSH * derate);
+  const nPanels = Math.max(1, Math.ceil(requiredW / panelW));
+  const power = nPanels * panelW;
+  const price = nPanels * PRICES.panels[panelW];
+  return { requiredW: roundUp(requiredW, 10), nPanels, power, price };
+}
+
+function controllersNeeded(arrayW, Vsys, controllerType) {
+  const Iarray = arrayW / Vsys; // rough DC current into battery bus
+  const rating = 60; // 60 A models (both)
+  const count = Math.max(1, Math.ceil(Iarray / rating));
+  const price = count * PRICES.controllers[controllerType];
+  return { count, Iarray: Math.round(Iarray), price };
+}
+
+function recommendControllerType(panelW) {
+  // 550 W panels typically like MPPT; 300 W can work with PWM (but MPPT is better).
+  return panelW >= 550 ? "mppt60A" : "pwm60A";
+}
+
+function dcCableSuggestions(kVA, Vsys, arrayW, arrayToCCLengthM = 10, batteryToInvLengthM = 2) {
+  // Array current estimate
+  const Iarray = arrayW / Vsys; // A
+  const arrayCable = cableSizeForCurrent(Iarray);
+  // Inverter DC current (kW = kVA*0.8), I = P / (η*V)
+  const inverterKW = kVA * 0.8;
+  const Iinv = (inverterKW * 1000) / (0.9 * Vsys);
+  const invCable = cableSizeForCurrent(Iinv);
+  return {
+    Iarray: Math.round(Iarray),
+    Iinv: Math.round(Iinv),
+    arrayCableMM2: arrayCable,
+    invCableMM2: invCable,
+    notes:
+      "Aim for ≤3% volt-drop. If runs are long or ambient is hot, step up one size. Use properly crimped lugs, DC-rated fuses/isolators, and parallel strings with individual fusing.",
+  };
+}
+
+// --- UI Components ---
+function Section({ title, children, id }) {
+  return (
+    <section id={id} className="py-8">
+      <h2 className="text-2xl font-semibold mb-4">{title}</h2>
+      <div className="bg-white/70 backdrop-blur rounded-2xl shadow p-4">{children}</div>
+    </section>
+  );
+}
+
+function Pill({ children }) {
+  return <span className="px-2 py-1 rounded-full bg-gray-100 text-gray-700 text-xs">{children}</span>;
+}
+
+export default function NYBSolarApp() {
+  const [appliances, setAppliances] = useState([
+    { name: "LED Bulbs", watts: 10, qty: 10, hours: 6, simultaneous: true },
+  ]);
+  const [panelW, setPanelW] = useState(550);
+  const [chem, setChem] = useState("lithium"); // "tubular" | "lithium"
+  const [daysAutonomy, setDaysAutonomy] = useState(1);
+  const [controllerType, setControllerType] = useState("auto"); // "auto" | "pwm60A" | "mppt60A"
+  const [budget, setBudget] = useState(2_500_000);
+
+  // Computations
+  const { dailyWh, peakW } = useMemo(() => {
+    let dWh = 0;
+    let pW = 0;
+    for (const a of appliances) {
+      const itemWh = a.watts * a.qty * a.hours;
+      dWh += itemWh;
+      if (a.simultaneous) pW += a.watts * a.qty;
     }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; background: var(--bg); color: var(--ink); }
+    // if nothing marked simultaneous, fallback to total as a safety
+    if (pW === 0) pW = appliances.reduce((s, a) => s + a.watts * a.qty, 0);
+    return { dailyWh: dWh, peakW: pW };
+  }, [appliances]);
 
-    header {
-      position: sticky; top: 0; z-index: 20;
-      display: flex; gap: 16px; align-items: center; justify-content: space-between;
-      padding: 14px 18px; background: linear-gradient(180deg, #0e7490, #0ea5b1);
-      color: #fff; box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+  const inverterPick = useMemo(() => pickInverterByPeakLoad(peakW), [peakW]);
+  const Vsys = useMemo(() => chooseSystemVoltage(inverterPick.kVA), [inverterPick]);
+
+  const batteryPlan = useMemo(() => batteryBlocksRequired(dailyWh, daysAutonomy, Vsys, chem), [dailyWh, daysAutonomy, Vsys, chem]);
+  const arr = useMemo(() => arraySizing(dailyWh, panelW), [dailyWh, panelW]);
+  const ctrlType = controllerType === "auto" ? recommendControllerType(panelW) : controllerType;
+  const controllers = useMemo(() => controllersNeeded(arr.power, Vsys, ctrlType), [arr, Vsys, ctrlType]);
+  const cables = useMemo(() => dcCableSuggestions(inverterPick.kVA, Vsys, arr.power), [inverterPick, Vsys, arr]);
+
+  const capex = useMemo(() => {
+    const items = [
+      { label: `${inverterPick.kVA} kVA Inverter`, price: inverterPick.price },
+      { label: `${arr.nPanels} × ${panelW} W Panels`, price: arr.price },
+      ctrlType === "mppt60A"
+        ? { label: `${controllers.count} × 60A MPPT`, price: controllers.price }
+        : { label: `${controllers.count} × 60A PWM`, price: controllers.price },
+      chem === "lithium"
+        ? { label: `Lithium: ${batteryPlan.label}`, price: batteryPlan.price }
+        : { label: `Tubular: ${batteryPlan.label}`, price: batteryPlan.price },
+    ];
+    const total = items.reduce((s, x) => s + x.price, 0);
+    return { items, total };
+  }, [inverterPick, arr, controllers, chem, batteryPlan, ctrlType, panelW]);
+
+  // Budget-based suggestion (very simple greedy):
+  const budgetPlan = useMemo(() => {
+    let remaining = budget;
+
+    // pick inverter based on remaining budget and peakW (try to satisfy load if possible)
+    const desiredInv = pickInverterByPeakLoad(peakW);
+    let inv = desiredInv;
+    if (desiredInv.price > remaining) {
+      // try lower sizes
+      const sizes = ["10kVA", "5kVA", "2kVA", "1kVA"];
+      for (let i = sizes.indexOf(`${desiredInv.kVA}kVA`) + 1; i < sizes.length; i++) {
+        const p = PRICES.inverter[sizes[i]];
+        if (p <= remaining) {
+          inv = {
+            kVA: parseInt(sizes[i]),
+            price: p,
+            kW: parseInt(sizes[i]) * 0.8,
+          };
+          break;
+        }
+      }
     }
-    header .brand { display: flex; gap: 10px; align-items: center; font-weight: 800; letter-spacing: .3px; }
-    header .brand .logo { width: 38px; height: 38px; border-radius: 10px; background: #fff; color: var(--brand-2); display:flex; align-items:center; justify-content:center; font-weight:900; }
-    header nav a { color: #e2f1ff; text-decoration: none; margin-left: 18px; font-weight: 600; }
-    header nav a:hover { text-decoration: underline; }
+    remaining -= inv.price;
+    const V = chooseSystemVoltage(inv.kVA);
 
-    .container { max-width: 1120px; margin: 20px auto; padding: 0 16px; }
+    // panels first (at least 4 pcs)
+    const panelPrice = PRICES.panels[panelW];
+    const minPanels = 4;
+    const maxPanels = Math.max(minPanels, Math.floor(remaining / panelPrice));
+    const nPanels = Math.max(minPanels, Math.min( maxPanels, 40 ));
+    remaining -= nPanels * panelPrice;
 
-    .hero { display: grid; grid-template-columns: 1.2fr .8fr; gap: 20px; align-items: center; }
-    @media (max-width: 920px) { .hero { grid-template-columns: 1fr; } }
-    .hero-card { background: var(--card); border-radius: 16px; padding: 18px; box-shadow: 0 6px 24px rgba(2, 132, 199, 0.08); border: 1px solid #e2e8f0; }
-    .hero h1 { margin: 0 0 8px; font-size: clamp(22px, 3vw, 34px); }
-    .sub { color: var(--muted); margin: 0 0 14px; }
-    .pill { display:inline-block; padding:6px 10px; background:#ecfeff; color:#0369a1; border-radius:999px; font-weight:700; font-size:12px; letter-spacing:.3px; }
+    // controller(s)
+    const arrW = nPanels * panelW;
+    const t = controllerType === "auto" ? recommendControllerType(panelW) : controllerType;
+    const ctrl = controllersNeeded(arrW, V, t);
+    if (ctrl.price > remaining) {
+      // if controller is too expensive (MPPT), fallback to PWM if using 300 W panels
+      if (t === "mppt60A" && panelW === 300) {
+        const ctrlPWM = controllersNeeded(arrW, V, "pwm60A");
+        if (ctrlPWM.price <= remaining) {
+          remaining -= ctrlPWM.price;
+        } else {
+          // reduce panels until we can afford controller
+          let np = nPanels;
+          let priceCtrl = ctrlPWM.price;
+          while (np > minPanels && priceCtrl > remaining) {
+            np -= 1;
+            priceCtrl = controllersNeeded(np * panelW, V, "pwm60A").price;
+          }
+          remaining += (nPanels - np) * panelPrice; // refund
+          remaining -= priceCtrl;
+        }
+      } else {
+        // reduce panels until controller fits
+        let np = nPanels;
+        let priceCtrl = ctrl.price;
+        while (np > minPanels && priceCtrl > remaining) {
+          np -= 1;
+          priceCtrl = controllersNeeded(np * panelW, V, t).price;
+        }
+        remaining += (nPanels - np) * panelPrice; // refund unused panels
+        remaining -= priceCtrl;
+      }
+    } else {
+      remaining -= ctrl.price;
+    }
 
-    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
-    .col-8 { grid-column: span 8; } .col-4 { grid-column: span 4; }
-    @media (max-width: 920px) { .col-8, .col-4 { grid-column: 1 / -1; } }
+    // batteries with whatever remains
+    let battLabel = "";
+    let battPrice = 0;
+    if (chem === "lithium") {
+      // prefer 15kWh then 10kWh
+      let n15 = Math.floor(remaining / PRICES.batteries.li15kWh);
+      remaining -= n15 * PRICES.batteries.li15kWh;
+      let n10 = Math.floor(remaining / PRICES.batteries.li10kWh);
+      remaining -= n10 * PRICES.batteries.li10kWh;
+      battPrice = n15 * PRICES.batteries.li15kWh + n10 * PRICES.batteries.li10kWh;
+      battLabel = `${n15}×15kWh, ${n10}×10kWh`;
+    } else {
+      const n = Math.floor(remaining / PRICES.batteries.tubular220Ah12V);
+      remaining -= n * PRICES.batteries.tubular220Ah12V;
+      battPrice = n * PRICES.batteries.tubular220Ah12V;
+      battLabel = `${n}×220Ah/12V (tubular)`;
+    }
 
-    .card { background: var(--card); border-radius: 16px; padding: 16px; box-shadow: 0 10px 26px rgba(15, 23, 42, 0.06); border: 1px solid #e2e8f0; }
-    .card h2, .card h3 { margin-top: 0; }
+    const used = budget - remaining;
+    return { used, remaining, inverter: inv, battLabel };
+  }, [budget, controllerType, panelW, chem, peakW]);
 
-    form .row { display: grid; grid-template-columns: repeat(12, 1fr); gap: 12px; }
-    form .field { grid-column: span 6; display: flex; flex-direction: column; gap: 6px; }
-    form .field.full { grid-column: 1 / -1; }
-    form label { font-size: 13px; color: var(--muted); font-weight: 700; }
-    input[type="text"], input[type="number"], input[type="email"], select, textarea { padding: 12px 12px; border: 1px solid #cbd5e1; border-radius: 10px; background: #fff; outline: none; }
-    input:focus, select:focus, textarea:focus { border-color: #0284c7; box-shadow: 0 0 0 4px var(--ring); }
+  // Handlers
+  const addAppliance = () =>
+    setAppliances((a) => [...a, { name: "", watts: 0, qty: 1, hours: 1, simultaneous: true }]);
 
-    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
-    .btn { border: none; padding: 12px 16px; border-radius: 12px; font-weight: 800; cursor: pointer; }
-    .btn.primary { background: linear-gradient(180deg, #0284c7, #0369a1); color: #fff; }
-    .btn.ghost { background: #fff; color: #0369a1; border: 1px solid #bae6fd; }
+  const removeAppliance = (i) => setAppliances((a) => a.filter((_, idx) => idx !== i));
 
-    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    @media (max-width: 720px) { .two-col { grid-template-columns: 1fr; } }
+  const updateAppliance = (i, key, val) =>
+    setAppliances((a) => a.map((row, idx) => (idx === i ? { ...row, [key]: val } : row)));
 
-    .breakdown { background: #f1f5f9; border-radius: 12px; padding: 12px; max-height: 380px; overflow: auto; }
-    .breakdown p { margin: 6px 0; }
-    .breakdown .line { display: flex; justify-content: space-between; gap: 10px; border-bottom: 1px dashed #cbd5e1; padding: 8px 0; }
-    .breakdown .line:last-child { border-bottom: none; }
-    .muted { color: var(--muted); font-size: 13px; }
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-amber-50 to-amber-100 text-gray-900">
+      {/* Navbar */}
+      <nav className="sticky top-0 z-20 bg-white/80 backdrop-blur border-b">
+        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 rounded-2xl bg-amber-500" />
+            <span className="font-bold text-lg">NYBSOLAR</span>
+          </div>
+          <div className="hidden md:flex gap-6 text-sm">
+            <a href="#designer" className="hover:text-amber-600">Designer</a>
+            <a href="#budget" className="hover:text-amber-600">Budget Builder</a>
+            <a href="#summary" className="hover:text-amber-600">Summary</a>
+            <a href="#services" className="hover:text-amber-600">Services</a>
+            <a href="#contact" className="hover:text-amber-600">Contact</a>
+          </div>
+        </div>
+      </nav>
 
-    .badge { font-size: 12px; font-weight: 800; background: #e0f2fe; color: #075985; padding: 6px 8px; border-radius: 999px; display: inline-block; }
+      {/* Hero */}
+      <header className="max-w-6xl mx-auto px-4 py-12">
+        <div className="grid md:grid-cols-2 gap-8 items-center">
+          <div>
+            <h1 className="text-4xl md:text-5xl font-extrabold leading-tight">Design your perfect solar system for <span className="text-amber-600">Sokoto</span>.</h1>
+            <p className="mt-4 text-lg text-gray-700">Input your appliances and budget. Our tool sizes inverter, batteries, panels, and controllers—then suggests DC cable thickness for a robust, standards‑minded installation.</p>
+            <div className="mt-4 flex flex-wrap gap-2"> 
+              <Pill>PSH = 6 h</Pill>
+              <Pill>Lithium / Tubular</Pill>
+              <Pill>MPPT / PWM</Pill>
+              <Pill>550 W / 300 W</Pill>
+            </div>
+            <a href="#designer" className="mt-6 inline-block bg-amber-600 hover:bg-amber-700 text-white px-6 py-3 rounded-2xl shadow">Start Designing</a>
+          </div>
+          <div className="bg-white rounded-2xl shadow p-6">
+            <ul className="space-y-2 text-sm">
+              <li>• 10 kVA inverter: {NAIRA(PRICES.inverter["10kVA"])}</li>
+              <li>• 5 kVA inverter: {NAIRA(PRICES.inverter["5kVA"])}</li>
+              <li>• 2 kVA inverter: {NAIRA(PRICES.inverter["2kVA"])}</li>
+              <li>• 1 kVA inverter: {NAIRA(PRICES.inverter["1kVA"])}</li>
+              <li>• 550 W panel: {NAIRA(PRICES.panels[550])}</li>
+              <li>• 300 W panel: {NAIRA(PRICES.panels[300])}</li>
+              <li>• 220 Ah tubular (12 V): {NAIRA(PRICES.batteries.tubular220Ah12V)}</li>
+              <li>• 10 kWh Li‑ion: {NAIRA(PRICES.batteries.li10kWh)}</li>
+              <li>• 15 kWh Li‑ion: {NAIRA(PRICES.batteries.li15kWh)}</li>
+              <li>• 60 A PWM: {NAIRA(PRICES.controllers.pwm60A)}</li>
+              <li>• 60 A MPPT: {NAIRA(PRICES.controllers.mppt60A)}</li>
+            </ul>
+          </div>
+        </div>
+      </header>
 
-    footer { text-align: center; color: var(--muted); font-size: 13px; padding: 32px 16px; }
+      <main className="max-w-6xl mx-auto px-4 pb-24">
+        <Section id="designer" title="1) Load-Based Solar Designer">
+          <div className="grid md:grid-cols-3 gap-4">
+            <div className="md:col-span-2 space-y-3">
+              {appliances.map((a, i) => (
+                <div key={i} className="grid grid-cols-12 gap-2 items-end">
+                  <input className="col-span-3 border rounded-xl p-2" placeholder="Appliance" value={a.name} onChange={(e)=>updateAppliance(i,'name',e.target.value)} />
+                  <input type="number" min={0} className="col-span-2 border rounded-xl p-2" placeholder="Watts" value={a.watts} onChange={(e)=>updateAppliance(i,'watts',parseFloat(e.target.value)||0)} />
+                  <input type="number" min={1} className="col-span-2 border rounded-xl p-2" placeholder="Qty" value={a.qty} onChange={(e)=>updateAppliance(i,'qty',parseInt(e.target.value)||0)} />
+                  <input type="number" min={0} className="col-span-2 border rounded-xl p-2" placeholder="Hours/day" value={a.hours} onChange={(e)=>updateAppliance(i,'hours',parseFloat(e.target.value)||0)} />
+                  <label className="col-span-2 flex items-center gap-2 text-sm"><input type="checkbox" checked={a.simultaneous} onChange={(e)=>updateAppliance(i,'simultaneous',e.target.checked)} /> Simultaneous</label>
+                  <button className="col-span-1 text-red-600 hover:underline" onClick={()=>removeAppliance(i)}>Remove</button>
+                </div>
+              ))}
+              <button className="bg-gray-900 text-white px-4 py-2 rounded-xl" onClick={addAppliance}>+ Add Appliance</button>
+            </div>
+            <div className="space-y-3">
+              <div>
+                <label className="text-sm">Panel Size</label>
+                <select className="w-full border rounded-xl p-2" value={panelW} onChange={(e)=>setPanelW(parseInt(e.target.value))}>
+                  <option value={550}>550 W (₦130,000)</option>
+                  <option value={300}>300 W (₦75,000)</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-sm">Battery Type</label>
+                <select className="w-full border rounded-xl p-2" value={chem} onChange={(e)=>setChem(e.target.value)}>
+                  <option value="lithium">Lithium‑ion</option>
+                  <option value="tubular">Tubular (Lead‑acid)</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-sm">Days of Autonomy</label>
+                <input type="number" min={0.5} step={0.5} className="w-full border rounded-xl p-2" value={daysAutonomy} onChange={(e)=>setDaysAutonomy(parseFloat(e.target.value)||1)} />
+              </div>
+              <div>
+                <label className="text-sm">Charge Controller</label>
+                <select className="w-full border rounded-xl p-2" value={controllerType} onChange={(e)=>setControllerType(e.target.value)}>
+                  <option value="auto">Auto (recommended)</option>
+                  <option value="mppt60A">60 A MPPT</option>
+                  <option value="pwm60A">60 A PWM</option>
+                </select>
+              </div>
+            </div>
+          </div>
 
-    .catalog { margin-top: 24px; }
-    .catalog-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
-    .product { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 12px; }
-    .product h4 { margin: 8px 0 6px; }
-    .product .tag { display:inline-block; background:#fef3c7; color:#92400e; font-size:12px; padding:4px 8px; border-radius:999px; font-weight:700; }
+          {/* Calculated KPIs */}
+          <div className="grid md:grid-cols-4 gap-4 mt-6">
+            <div className="bg-white rounded-2xl p-4 shadow">
+              <div className="text-sm text-gray-500">Daily Energy</div>
+              <div className="text-2xl font-bold">{(dailyWh/1000).toFixed(2)} kWh/day</div>
+            </div>
+            <div className="bg-white rounded-2xl p-4 shadow">
+              <div className="text-sm text-gray-500">Peak Load (simultaneous)</div>
+              <div className="text-2xl font-bold">{peakW} W</div>
+            </div>
+            <div className="bg-white rounded-2xl p-4 shadow">
+              <div className="text-sm text-gray-500">Recommended Inverter</div>
+              <div className="text-2xl font-bold">{inverterPick.kVA} kVA</div>
+              <div className="text-xs text-gray-600">{NAIRA(inverterPick.price)} • {chooseSystemVoltage(inverterPick.kVA)} V</div>
+            </div>
+            <div className="bg-white rounded-2xl p-4 shadow">
+              <div className="text-sm text-gray-500">Array Size (est.)</div>
+              <div className="text-2xl font-bold">{arr.nPanels} × {panelW} W</div>
+              <div className="text-xs text-gray-600">≈ {Math.round(arr.power/1000)} kWp • {NAIRA(arr.price)}</div>
+            </div>
+          </div>
 
-    .assumptions { font-size: 12px; line-height: 1.6; }
-    .assumptions table { width:100%; border-collapse: collapse; }
-    .assumptions th, .assumptions td { text-align:left; padding:6px 4px; border-bottom:1px dashed #e2e8f0; font-size:12px; }
+          {/* Battery & Controllers */}
+          <div className="grid md:grid-cols-3 gap-4 mt-4">
+            <div className="bg-white rounded-2xl p-4 shadow">
+              <div className="text-sm text-gray-500">Battery Plan ({chem === 'lithium' ? 'Lithium‑ion (90% usable)' : 'Tubular (50% usable)'})</div>
+              <div className="text-lg font-semibold mt-1">{batteryPlan.label}</div>
+              <div className="text-xs text-gray-600">Usable ≈ {(batteryPlan.usableWh/1000).toFixed(1)} kWh • {NAIRA(batteryPlan.price)}</div>
+            </div>
+            <div className="bg-white rounded-2xl p-4 shadow">
+              <div className="text-sm text-gray-500">Charge Controllers</div>
+              <div className="text-lg font-semibold mt-1">{controllers.count} × 60 A {ctrlType.toUpperCase().replace('60A','')}</div>
+              <div className="text-xs text-gray-600">Array current ≈ {controllers.Iarray} A • {NAIRA(controllers.price)}</div>
+            </div>
+            <div className="bg-white rounded-2xl p-4 shadow">
+              <div className="text-sm text-gray-500">DC Cable Suggestions</div>
+              <div className="text-xs text-gray-600">Array → Controller: ~{cables.Iarray} A → <b>{cables.arrayCableMM2} mm²</b></div>
+              <div className="text-xs text-gray-600">Battery → Inverter: ~{cables.Iinv} A → <b>{cables.invCableMM2} mm²</b></div>
+              <div className="text-xs text-gray-500 mt-1">{cables.notes}</div>
+            </div>
+          </div>
+        </Section>
 
-    .ok { color: #166534; }
-    .warn { color: #92400e; }
-    .err { color: #991b1b; }
-  </style>
-</head>
-<body>
-  <header>
-    <div class="brand">
-      <div class="logo">NYB</div>
-      <div>
-        <div style="font-size: 14px; opacity:.9">NYB Solar & CCTV</div>
-        <div style="font-size: 12px; opacity:.85">Clean Power • Smart Security</div>
-      </div>
+        <Section id="budget" title="2) Budget-Based Builder">
+          <div className="grid md:grid-cols-3 gap-4 items-end">
+            <div className="md:col-span-2">
+              <label className="text-sm">Enter your budget (₦)</label>
+              <input type="number" className="w-full border rounded-xl p-3" value={budget} onChange={(e)=>setBudget(parseInt(e.target.value)||0)} />
+              <p className="text-xs text-gray-600 mt-1">The tool will allocate an inverter, panels, controllers and as many batteries as possible within your budget.</p>
+            </div>
+            <div className="bg-white rounded-2xl p-4 shadow">
+              <div className="text-sm text-gray-500">Budget Summary</div>
+              <div className="text-lg font-semibold">Used: {NAIRA(budgetPlan.used)}</div>
+              <div className="text-xs text-gray-600">Remaining: {NAIRA(budgetPlan.remaining)}</div>
+              <div className="text-xs text-gray-600 mt-2">Inverter: {budgetPlan.inverter.kVA} kVA</div>
+              <div className="text-xs text-gray-600">Batteries: {budgetPlan.battLabel}</div>
+            </div>
+          </div>
+        </Section>
+
+        <Section id="summary" title="3) Cost Summary & Quotation">
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-gray-600">
+                  <th className="py-2">Item</th>
+                  <th className="py-2">Price</th>
+                </tr>
+              </thead>
+              <tbody>
+                {capex.items.map((it, idx) => (
+                  <tr key={idx} className="border-t">
+                    <td className="py-2">{it.label}</td>
+                    <td className="py-2">{NAIRA(it.price)}</td>
+                  </tr>
+                ))}
+                <tr className="border-t font-semibold">
+                  <td className="py-2">Subtotal (Equipment)</td>
+                  <td className="py-2">{NAIRA(capex.total)}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-gray-600 mt-3">Note: Prices are as provided and exclude BOS accessories (mounting rails, breakers, isolators, combiner boxes, MC4s, conduits, labour, logistics, and taxes). Add a margin to cover installation & after‑sales support.</p>
+        </Section>
+
+        <Section id="services" title="Why Choose NYBSOLAR?">
+          <div className="grid md:grid-cols-3 gap-4">
+            <div className="bg-white rounded-2xl p-4 shadow">
+              <div className="font-semibold">Professional Sizing</div>
+              <p className="text-sm text-gray-600">Load & budget engines tailored for Sokoto’s 6 h PSH, with transparent assumptions you can export into proposals.</p>
+            </div>
+            <div className="bg-white rounded-2xl p-4 shadow">
+              <div className="font-semibold">Premium Components</div>
+              <p className="text-sm text-gray-600">Options for MPPT/PWM, tubular or lithium storage, and 550 W or 300 W panels—configured to your needs.</p>
+            </div>
+            <div className="bg-white rounded-2xl p-4 shadow">
+              <div className="font-semibold">After‑Sales & Monitoring</div>
+              <p className="text-sm text-gray-600">Add remote monitoring, scheduled maintenance, and performance audits for peak uptime.</p>
+            </div>
+          </div>
+        </Section>
+
+        <Section id="contact" title="Get a Formal Quote">
+          <div className="grid md:grid-cols-2 gap-4">
+            <div>
+              <p className="text-sm text-gray-700">Ready to proceed? Share your contact details and we’ll send a formal quotation with installation timeline.</p>
+              <form className="mt-3 grid grid-cols-2 gap-2">
+                <input placeholder="Full name" className="border rounded-xl p-2 col-span-2 md:col-span-1" />
+                <input placeholder="Phone / WhatsApp" className="border rounded-xl p-2 col-span-2 md:col-span-1" />
+                <input placeholder="Email" className="border rounded-xl p-2 col-span-2" />
+                <textarea placeholder="Project details / address" className="border rounded-xl p-2 col-span-2" rows={3} />
+                <button type="button" className="bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-xl col-span-2">Request Quote</button>
+              </form>
+            </div>
+            <div className="bg-white rounded-2xl p-4 shadow">
+              <div className="font-semibold">Engineering Notes</div>
+              <ul className="list-disc pl-5 text-sm text-gray-700 space-y-1 mt-2">
+                <li>For 10 kVA @ 48 V, DC current can approach ~180–200 A → use ≥ {cables.invCableMM2} mm² with short runs and proper protection.</li>
+                <li>Parallel strings must be individually fused; include DC isolators and SPD as per good practice.</li>
+                <li>Keep DC volt‑drop ≤ 3%; upsize cables for long runs or attic heat.</li>
+                <li>Confirm roof structure & apply proper rail/roof‑hook spacing; maintain earthing and lightning protection.</li>
+              </ul>
+            </div>
+          </div>
+        </Section>
+      </main>
+
+      <footer className="bg-white border-t">
+        <div className="max-w-6xl mx-auto px-4 py-6 text-sm flex flex-col md:flex-row items-center justify-between gap-2">
+          <div>© {new Date().getFullYear()} NYBSOLAR • Sokoto, Nigeria</div>
+          <div className="text-gray-600">Solar • Inverters • Batteries • CCTV • Networking</div>
+        </div>
+      </footer>
     </div>
-    <nav>
-      <a href="#quote">Get a Quote</a>
-      <a href="#catalog">Catalog</a>
-      <a href="#contact">Contact</a>
-    </nav>
-  </header>
-
-  <div class="container">
-    <section class="hero">
-      <div class="hero-card">
-        <span class="pill">INSTANT ESTIMATOR</span>
-        <h1>Estimate your Solar & CCTV system in minutes</h1>
-        <p class="sub">Enter your home or office details below. We’ll estimate panel count, inverter & battery size, and a rough budget. You can send the result to us on WhatsApp or email for a final quote.</p>
-        <a class="btn ghost" href="#assumptions">View calculation assumptions</a>
-      </div>
-      <div class="hero-card">
-        <div class="assumptions">
-          <strong>Quick tips</strong>
-          <ul>
-            <li>Back‑up hours = how long you want power during an outage.</li>
-            <li>AC loads are heavy; consider running fewer ACs on backup.</li>
-            <li>All prices are placeholders — adjust in the code (PRICING block).</li>
-          </ul>
-          <p class="muted">This is a planning tool. Final pricing depends on site survey, cable runs, roof type, brand selection, and FX rates.</p>
-        </div>
-      </div>
-    </section>
-
-    <section id="quote" class="grid" style="margin-top: 18px;">
-      <div class="col-8 card">
-        <h2>Get a Quote</h2>
-        <form id="quoteForm">
-          <div class="row" style="margin-bottom: 10px;">
-            <div class="field">
-              <label>Full name</label>
-              <input type="text" id="custName" placeholder="e.g. John Doe" required>
-            </div>
-            <div class="field">
-              <label>Phone (WhatsApp)</label>
-              <input type="text" id="custPhone" placeholder="e.g. +234..." required>
-            </div>
-            <div class="field">
-              <label>Email</label>
-              <input type="email" id="custEmail" placeholder="e.g. you@example.com">
-            </div>
-            <div class="field">
-              <label>City</label>
-              <input type="text" id="custCity" placeholder="e.g. Lagos">
-            </div>
-            <div class="field">
-              <label>Include installation?</label>
-              <select id="includeInstall">
-                <option value="yes" selected>Yes</option>
-                <option value="no">No (equipment only)</option>
-              </select>
-            </div>
-            <div class="field">
-              <label>Add CCTV package?</label>
-              <select id="includeCctv">
-                <option value="none" selected>No</option>
-                <option value="basic">Basic (DVR, 4 cams)</option>
-                <option value="pro">Pro (NVR, 8 cams)</option>
-              </select>
-            </div>
-          </div>
-
-          <h3>House / Office Details</h3>
-          <div class="row" style="margin-bottom: 4px;">
-            <div class="field">
-              <label>Floor area (m²)</label>
-              <input type="number" id="floorArea" placeholder="e.g. 120" min="0" value="80">
-            </div>
-            <div class="field">
-              <label>Backup hours desired</label>
-              <select id="backupHours">
-                <option value="6">6 hours</option>
-                <option value="12" selected>12 hours</option>
-                <option value="24">24 hours</option>
-              </select>
-            </div>
-            <div class="field">
-              <label>Roof type</label>
-              <select id="roofType">
-                <option value="metal" selected>Metal</option>
-                <option value="shingles">Shingles</option>
-                <option value="flat">Flat / Concrete</option>
-              </select>
-            </div>
-            <div class="field">
-              <label>Wiring distance estimate (m)</label>
-              <input type="number" id="wireLen" placeholder="e.g. 30" min="0" value="25">
-            </div>
-          </div>
-
-          <h3>Appliances (quantity)</h3>
-          <div class="row">
-            <div class="field"><label>LED bulbs</label><input type="number" id="led" min="0" value="8"></div>
-            <div class="field"><label>Ceiling / standing fans</label><input type="number" id="fans" min="0" value="4"></div>
-            <div class="field"><label>TVs</label><input type="number" id="tv" min="0" value="2"></div>
-            <div class="field"><label>Laptops</label><input type="number" id="laptop" min="0" value="2"></div>
-            <div class="field"><label>Routers</label><input type="number" id="router" min="0" value="1"></div>
-            <div class="field"><label>Refrigerators</label><input type="number" id="fridge" min="0" value="1"></div>
-            <div class="field"><label>Freezers</label><input type="number" id="freezer" min="0" value="0"></div>
-            <div class="field"><label>AC (1 HP)</label><input type="number" id="ac1" min="0" value="1"></div>
-            <div class="field"><label>AC (2 HP)</label><input type="number" id="ac2" min="0" value="0"></div>
-            <div class="field"><label>Water pump</label><input type="number" id="pump" min="0" value="0"></div>
-            <div class="field full"><label>Other loads (watts)</label><input type="number" id="otherW" min="0" value="0" placeholder="Custom continuous watts"></div>
-          </div>
-
-          <div class="actions" style="margin-top: 12px;">
-            <button type="button" class="btn primary" onclick="computeEstimate()">Compute Cost</button>
-            <button type="reset" class="btn ghost" onclick="resetResults()">Reset</button>
-          </div>
-        </form>
-      </div>
-
-      <div class="col-4 card">
-        <h3>Estimate</h3>
-        <div id="estimateBox" class="breakdown">
-          <p class="muted">Fill the form and click <strong>Compute Cost</strong> to see an itemized estimate here.</p>
-        </div>
-        <div class="two-col" style="margin-top: 10px;">
-          <button class="btn primary" onclick="shareWhatsapp()">Share via WhatsApp</button>
-          <button class="btn ghost" onclick="copySummary()">Copy summary</button>
-        </div>
-        <p class="muted" style="margin-top:8px">Need help? <a href="#contact">Contact us</a> for a free consultation.</p>
-      </div>
-    </section>
-
-    <section id="assumptions" class="card" style="margin-top: 16px;">
-      <h3>Calculation assumptions</h3>
-      <div class="two-col">
-        <div class="assumptions">
-          <table>
-            <tr><th>Appliance</th><th>Watts</th></tr>
-            <tr><td>LED bulb</td><td>10 W</td></tr>
-            <tr><td>Fan</td><td>75 W</td></tr>
-            <tr><td>TV</td><td>100 W</td></tr>
-            <tr><td>Laptop</td><td>60 W</td></tr>
-            <tr><td>Router</td><td>10 W</td></tr>
-            <tr><td>Fridge</td><td>150 W × 0.6 duty</td></tr>
-            <tr><td>Freezer</td><td>180 W × 0.6 duty</td></tr>
-            <tr><td>AC 1 HP</td><td>750 W</td></tr>
-            <tr><td>AC 2 HP</td><td>1500 W</td></tr>
-            <tr><td>Water pump</td><td>1000 W</td></tr>
-          </table>
-          <p class="muted">Diversity factor: 0.6 applied to totals to reflect not-all-at-once use (excluding AC & pumps). Battery DoD = 80%, inverter & system efficiency = 90%.
-          Peak sun hours assumed ~4.5 (Lagos) with derate 0.75.
-          </p>
-        </div>
-        <div class="assumptions">
-          <table>
-            <tr><th>Placeholder unit prices (NGN)</th><th>Value</th></tr>
-            <tr><td>Solar panel 550W</td><td>₦180,000</td></tr>
-            <tr><td>Battery (per kWh, LiFePO₄)</td><td>₦190,000</td></tr>
-            <tr><td>Inverter (per kW)</td><td>₦120,000</td></tr>
-            <tr><td>Mounting + BOS</td><td>~15% of hardware</td></tr>
-            <tr><td>Wiring (per meter)</td><td>₦2,000</td></tr>
-            <tr><td>Installation labour</td><td>~10% of hardware</td></tr>
-            <tr><td>CCTV basic (4 cams + DVR)</td><td>₦420,000</td></tr>
-            <tr><td>CCTV pro (8 cams + NVR)</td><td>₦980,000</td></tr>
-          </table>
-          <p class="muted">Edit these prices in the code block <strong>PRICING</strong> to match your suppliers. FX & brands can shift costs.</p>
-        </div>
-      </div>
-    </section>
-
-    <section id="catalog" class="catalog card">
-      <h3>Catalog (sample)</h3>
-      <div class="catalog-grid">
-        <div class="product">
-          <span class="tag">Solar</span>
-          <h4>550W Tier-1 Panel</h4>
-          <p>High-efficiency mono PERC. 25‑year performance warranty.</p>
-        </div>
-        <div class="product">
-          <span class="tag">Solar</span>
-          <h4>Hybrid Inverter 5 kW</h4>
-          <p>Pure sine-wave, MPPT, Wi‑Fi app monitoring.</p>
-        </div>
-        <div class="product">
-          <span class="tag">Battery</span>
-          <h4>LiFePO₄ 5 kWh</h4>
-          <p>Long cycle life, wall‑mount, BMS protected.</p>
-        </div>
-        <div class="product">
-          <span class="tag">CCTV</span>
-          <h4>4‑Camera Kit</h4>
-          <p>1080p cameras, DVR, 1TB HDD, remote view.</p>
-        </div>
-      </div>
-    </section>
-
-    <section id="contact" class="card" style="margin-top: 16px;">
-      <h3>Contact</h3>
-      <p class="muted">Questions or a site survey? Call/WhatsApp <strong id="phoneDisplay">+234 000 000 0000</strong> or email <strong id="emailDisplay">hello@nybsolar.com</strong>.</p>
-      <form onsubmit="event.preventDefault(); shareWhatsapp();">
-        <div class="two-col">
-          <input id="contactName" type="text" placeholder="Your name" required />
-          <input id="contactPhone" type="text" placeholder="Phone / WhatsApp" required />
-        </div>
-        <textarea id="contactMsg" rows="4" placeholder="Your message"></textarea>
-        <div class="actions" style="margin-top:8px;">
-          <button class="btn primary" type="submit">Send via WhatsApp</button>
-          <button class="btn ghost" type="button" onclick="location.href='mailto:hello@nybsolar.com'">Email us</button>
-        </div>
-      </form>
-    </section>
-
-    <footer>
-      © <span id="year"></span> NYB Solar & CCTV — All rights reserved.
-    </footer>
-  </div>
-
-  <script>
-    // ==========================
-    // CONFIG — edit to your brand
-    // ==========================
-    const COMPANY = {
-      phone: "+2340000000000", // digits only for wa.me link
-      phoneHuman: "+234 000 000 0000",
-      email: "hello@nybsolar.com",
-      city: "Lagos"
-    };
-
-    document.getElementById('phoneDisplay').textContent = COMPANY.phoneHuman;
-    document.getElementById('emailDisplay').textContent = COMPANY.email;
-    document.getElementById('year').textContent = new Date().getFullYear();
-
-    // ==========================
-    // PRICING — placeholder NGN
-    // ==========================
-    const PRICING = {
-      panelW: 550,                 // watts per panel
-      panelPrice: 180000,          // NGN per panel
-      batteryPerKWh: 190000,       // NGN per kWh (LiFePO4)
-      inverterPerKW: 120000,       // NGN per kW
-      wiringPerMeter: 2000,        // NGN per meter
-      bosPercent: 0.15,            // mounts + BOS percentage of hardware
-      labourPercent: 0.10,         // installation labour percent of hardware
-      cctv: { basic: 420000, pro: 980000 }
-    };
-
-    // ==========================
-    // ENGINE — sizing rules
-    // ==========================
-    const LOAD = {
-      led: 10, fan: 75, tv: 100, laptop: 60, router: 10,
-      fridge: 150 * 0.6, freezer: 180 * 0.6,
-      ac1: 750, ac2: 1500, pump: 1000
-    };
-
-    const EFF = { diversity: 0.6, battDoD: 0.8, systemEff: 0.9, psHrs: 4.5, derate: 0.75 };
-
-    function val(id){ return Number(document.getElementById(id).value || 0); }
-
-    function computeEstimate(){
-      // Collect inputs
-      const name = document.getElementById('custName').value.trim();
-      if(!name){ alert('Please enter your full name.'); return; }
-
-      const includeInstall = document.getElementById('includeInstall').value === 'yes';
-      const includeCctv = document.getElementById('includeCctv').value; // none/basic/pro
-      const wireLen = val('wireLen');
-      const backupHours = val('backupHours');
-
-      const qty = {
-        led: val('led'), fans: val('fans'), tv: val('tv'), laptop: val('laptop'), router: val('router'),
-        fridge: val('fridge'), freezer: val('freezer'), ac1: val('ac1'), ac2: val('ac2'), pump: val('pump'), otherW: val('otherW')
-      };
-
-      // Compute continuous watts
-      let baseW = qty.led*LOAD.led + qty.fans*LOAD.fan + qty.tv*LOAD.tv + qty.laptop*LOAD.laptop + qty.router*LOAD.router + qty.fridge*LOAD.fridge + qty.freezer*LOAD.freezer + qty.otherW;
-      // AC & pump treated as on-when-needed; include at 100%
-      const heavyW = qty.ac1*LOAD.ac1 + qty.ac2*LOAD.ac2 + qty.pump*LOAD.pump;
-      const diversifiedW = baseW * EFF.diversity + heavyW; // W
-
-      // Energy needed (Wh)
-      const energyWh = diversifiedW * backupHours; // Wh
-      // Battery sizing (kWh) with DoD & eff
-      const batteryKWhReq = (energyWh / 1000) / (EFF.battDoD * EFF.systemEff);
-      // Inverter size (kW) — peak watts /1000 with headroom
-      const inverterKW = Math.max(1, Math.ceil((diversifiedW * 1.2) / 1000));
-      // PV array required for daily energy recovery (kW)
-      const dailyKWh = energyWh / 1000;
-      const pvKW = Math.ceil((dailyKWh * 1.3) / (EFF.psHrs * EFF.derate));
-      const panelCount = Math.max(1, Math.ceil((pvKW * 1000) / PRICING.panelW));
-
-      // Costs
-      const costPanels = panelCount * PRICING.panelPrice;
-      const costBattery = Math.ceil(batteryKWhReq) * PRICING.batteryPerKWh;
-      const costInverter = inverterKW * PRICING.inverterPerKW;
-      const costWiring = wireLen * PRICING.wiringPerMeter;
-      const hardware = costPanels + costBattery + costInverter;
-      const bos = Math.round(hardware * PRICING.bosPercent);
-      const labour = includeInstall ? Math.round(hardware * PRICING.labourPercent) : 0;
-      const cctv = includeCctv === 'basic' ? PRICING.cctv.basic : includeCctv === 'pro' ? PRICING.cctv.pro : 0;
-
-      const subtotal = hardware + bos + labour + costWiring + cctv;
-      const vat = 0; // set if needed
-      const total = subtotal + vat;
-
-      const estBox = document.getElementById('estimateBox');
-      const fmt = (n)=>`₦${n.toLocaleString()}`;
-
-      const summary = {
-        watts: Math.round(diversifiedW),
-        batteryKWh: Math.ceil(batteryKWhReq),
-        inverterKW,
-        pvKW,
-        panels: panelCount,
-        costs: { costPanels, costBattery, costInverter, bos, costWiring, labour, cctv, subtotal, vat, total }
-      };
-
-      estBox.innerHTML = `
-        <div class="line"><span>Estimated continuous load</span><strong>${summary.watts} W</strong></div>
-        <div class="line"><span>Backup hours</span><strong>${backupHours} h</strong></div>
-        <div class="line"><span>Recommended inverter</span><strong>${summary.inverterKW} kW</strong></div>
-        <div class="line"><span>Battery bank</span><strong>${summary.batteryKWh} kWh (LiFePO₄)</strong></div>
-        <div class="line"><span>PV array (approx.)</span><strong>${summary.pvKW} kW</strong></div>
-        <div class="line"><span>Panel count (550W)</span><strong>${summary.panels} pcs</strong></div>
-        <hr/>
-        <div class="line"><span>Panels</span><strong>${fmt(summary.costs.costPanels)}</strong></div>
-        <div class="line"><span>Batteries</span><strong>${fmt(summary.costs.costBattery)}</strong></div>
-        <div class="line"><span>Inverter</span><strong>${fmt(summary.costs.costInverter)}</strong></div>
-        <div class="line"><span>Mounting + BOS</span><strong>${fmt(summary.costs.bos)}</strong></div>
-        <div class="line"><span>Wiring (${wireLen} m)</span><strong>${fmt(summary.costs.costWiring)}</strong></div>
-        <div class="line"><span>Labour ${includeInstall ? '' : '(excluded)'}</span><strong>${fmt(summary.costs.labour)}</strong></div>
-        ${cctv ? `<div class="line"><span>CCTV package</span><strong>${fmt(summary.costs.cctv)}</strong></div>` : ''}
-        <div class="line"><span>VAT</span><strong>${fmt(summary.costs.vat)}</strong></div>
-        <div class="line"><span><strong>Total (estimate)</strong></span><strong>${fmt(summary.costs.total)}</strong></div>
-        <p class="muted">This is a planning estimate. We’ll confirm after a site survey.</p>
-      `;
-
-      // Save for sharing
-      window.__lastEstimate = { name, includeInstall, includeCctv, wireLen, backupHours, qty, summary };
-    }
-
-    function resetResults(){
-      document.getElementById('estimateBox').innerHTML = '<p class="muted">Fill the form and click <strong>Compute Cost</strong> to see an itemized estimate here.</p>';
-      window.__lastEstimate = null;
-    }
-
-    function buildShareText(){
-      const e = window.__lastEstimate; if(!e){ return 'No estimate yet.'; }
-      const fmt = (n)=>`₦${n.toLocaleString()}`;
-      return (
-        `Quote request — ${e.name}\n`+
-        `Backup: ${e.backupHours}h, Wiring: ${e.wireLen}m, Install: ${e.includeInstall ? 'Yes' : 'No'}\n`+
-        `Loads: LED ${e.qty.led}, Fans ${e.qty.fans}, TV ${e.qty.tv}, Laptops ${e.qty.laptop}, Router ${e.qty.router}, `+
-        `Fridge ${e.qty.fridge}, Freezer ${e.qty.freezer}, AC1HP ${e.qty.ac1}, AC2HP ${e.qty.ac2}, Pump ${e.qty.pump}, OtherW ${e.qty.otherW}\n`+
-        `Sizing → Inverter: ${e.summary.inverterKW}kW, Battery: ${e.summary.batteryKWh}kWh, Panels: ${e.summary.panels} (≈${e.summary.pvKW}kW PV)\n`+
-        `Costs → Panels ${fmt(e.summary.costs.costPanels)}, Batteries ${fmt(e.summary.costs.costBattery)}, Inverter ${fmt(e.summary.costs.costInverter)}, BOS ${fmt(e.summary.costs.bos)}, Wiring ${fmt(e.summary.costs.costWiring)}, Labour ${fmt(e.summary.costs.labour)}, CCTV ${fmt(e.summary.costs.cctv)}\n`+
-        `Total (est.): ${fmt(e.summary.costs.total)}`
-      );
-    }
-
-    function shareWhatsapp(){
-      const msg = encodeURIComponent(buildShareText());
-      const phone = COMPANY.phone.replace(/\D/g, '');
-      if(!phone){ alert('Company WhatsApp number not set. Edit COMPANY.phone in code.'); return; }
-      window.open(`https://wa.me/${phone}?text=${msg}`, '_blank');
-    }
-
-    function copySummary(){
-      const text = buildShareText();
-      navigator.clipboard.writeText(text).then(()=>{
-        alert('Summary copied to clipboard. You can paste it into WhatsApp or email.');
-      });
-    }
-  </script>
-</body>
-</html>
+  );
+}
